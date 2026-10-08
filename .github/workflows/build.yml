@@ -1,0 +1,266 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate project files
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "WifiWatch"
+          include(":app")
+          EOF
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.raj.wifiwatch"
+              compileSdk = 35
+              defaultConfig { applicationId = "com.raj.wifiwatch"; minSdk = 29; targetSdk = 35; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+              <application android:label="WifiWatch" android:icon="@android:drawable/ic_dialog_info">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".MonitorService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="network_monitoring"/>
+                  </service>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/raj/wifiwatch
+          cat > app/src/main/java/com/raj/wifiwatch/BootReceiver.kt <<'EOF'
+          package com.raj.wifiwatch
+          import android.content.*
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  if (c.getSharedPreferences("p", 0).getBoolean("on", false))
+                      c.startForegroundService(Intent(c, MonitorService::class.java))
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/raj/wifiwatch
+          cat > app/src/main/java/com/raj/wifiwatch/MonitorService.kt <<'EOF'
+          package com.raj.wifiwatch
+          import android.app.*
+          import android.content.*
+          import android.content.pm.ServiceInfo
+          import android.net.*
+          import android.net.wifi.*
+          import android.os.*
+          import java.io.File
+          import java.net.*
+
+          object Store {
+              fun f(c: Context) = File(c.filesDir, "log.csv")
+              fun add(c: Context, s: Long, e: Long, t: String) { f(c).appendText("$s,$e,$t\n") }
+              fun all(c: Context): List<Triple<Long, Long, String>> =
+                  if (!f(c).exists()) emptyList() else f(c).readLines().mapNotNull {
+                      val x = it.split(","); if (x.size == 3) Triple(x[0].toLong(), x[1].toLong(), x[2]) else null }
+          }
+
+          class MonitorService : Service() {
+              @Volatile var on = false
+              var wl: PowerManager.WakeLock? = null
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel("w", "Monitor", NotificationManager.IMPORTANCE_LOW))
+                  startForeground(1, note("Starting..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  if (!on) {
+                      on = true
+                      wl = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ww:l").apply { acquire() }
+                      Thread { loop() }.start()
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() { on = false; wl?.release() }
+
+              fun note(t: String) = Notification.Builder(this, "w").setContentTitle("WifiWatch")
+                  .setContentText(t).setSmallIcon(android.R.drawable.ic_dialog_info).setOngoing(true).build()
+
+              fun reach(n: Network, h: String, port: Int) = try {
+                  n.socketFactory.createSocket().use { it.connect(InetSocketAddress(h, port), 2500) }; true
+              } catch (e: Exception) { e.message?.contains("refused", true) == true }
+
+              fun probe(cm: ConnectivityManager, wm: WifiManager): String {
+                  val n = cm.allNetworks.firstOrNull { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+                      ?: return "LAN_DOWN"
+                  if (reach(n, "1.1.1.1", 443) || reach(n, "8.8.8.8", 53)) return "OK"
+                  val g = wm.dhcpInfo.gateway
+                  val gw = "${g and 255}.${g shr 8 and 255}.${g shr 16 and 255}.${g shr 24 and 255}"
+                  return if (reach(n, gw, 80)) "ISP_DOWN" else "LAN_DOWN"
+              }
+
+              fun loop() {
+                  val p = getSharedPreferences("p", 0)
+                  val nm = getSystemService(NotificationManager::class.java)
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  val wm = applicationContext.getSystemService(WifiManager::class.java)
+                  val t0 = System.currentTimeMillis(); val hb = p.getLong("hb", 0)
+                  if (hb > 0 && t0 - hb > 60000) Store.add(this, hb, t0, "NOT_MONITORED")
+                  var st = "AWAY"; var since = t0
+                  while (on) {
+                      val home = p.getString("ssid", "") ?: ""
+                      val wi = wm.connectionInfo
+                      val ssid = wi.ssid?.trim('"') ?: ""
+                      val linkUp = wi.supplicantState == SupplicantState.COMPLETED && wi.networkId != -1
+                      val now = System.currentTimeMillis()
+                      p.edit().putLong("hb", now).apply()
+                      val nx = when {
+                          linkUp && ssid == home -> probe(cm, wm)
+                          linkUp -> "AWAY"
+                          st == "AWAY" -> "AWAY"
+                          st == "WIFI_DOWN" && now - since > 1800000 -> "AWAY"
+                          else -> "WIFI_DOWN"
+                      }
+                      if (nx != st) {
+                          if (st != "OK" && st != "AWAY" && !(st == "WIFI_DOWN" && nx == "AWAY") && now - since >= 5000)
+                              Store.add(this, since, now, st)
+                          st = nx; since = now
+                          nm.notify(1, note(if (st == "AWAY") "Not at home WiFi - idle" else "Home WiFi: $st"))
+                      }
+                      Thread.sleep(if (st == "AWAY") 15000 else 5000)
+                  }
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/raj/wifiwatch
+          cat > app/src/main/java/com/raj/wifiwatch/Report.kt <<'EOF'
+          package com.raj.wifiwatch
+          import android.content.*
+          import android.graphics.Paint
+          import android.graphics.pdf.PdfDocument
+          import android.provider.MediaStore
+          import java.io.OutputStream
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          object Report {
+              val df = SimpleDateFormat("dd MMM yyyy HH:mm:ss", Locale.getDefault())
+              fun dur(ms: Long) = "${ms / 60000}m ${ms / 1000 % 60}s"
+
+              fun make(c: Context, days: Int): String {
+                  val from = System.currentTimeMillis() - days * 86400000L
+                  val rows = Store.all(c).filter { it.first >= from }.sortedBy { it.first }
+                  val out = rows.filter { it.third != "NOT_MONITORED" }
+                  val total = out.sumOf { it.second - it.first }
+                  val lines = mutableListOf(
+                      "WIFI / INTERNET OUTAGE REPORT", "Last $days days. Generated ${df.format(Date())}",
+                      "Outages: ${out.size}   Total downtime: ${dur(total)}   Longest: ${dur(out.maxOfOrNull { it.second - it.first } ?: 0)}",
+                      "WIFI_DOWN = phone lost WiFi.  LAN_DOWN = WiFi on, router unreachable.",
+                      "ISP_DOWN = router reachable but no internet.  NOT_MONITORED = app not running.", "")
+                  rows.forEach { lines += "${df.format(Date(it.first))} -> ${df.format(Date(it.second))}  ${dur(it.second - it.first)}  ${it.third}" }
+                  val pdf = PdfDocument(); val paint = Paint().apply { textSize = 9f }
+                  var page: PdfDocument.Page? = null; var y = 0; var n = 0
+                  for (l in lines) {
+                      if (page == null || y > 800) {
+                          page?.let { pdf.finishPage(it) }
+                          page = pdf.startPage(PdfDocument.PageInfo.Builder(595, 842, ++n).create()); y = 40
+                      }
+                      page!!.canvas.drawText(l, 30f, y.toFloat(), paint); y += 14
+                  }
+                  page?.let { pdf.finishPage(it) }
+                  save(c, "outages_${days}d.pdf", "application/pdf") { pdf.writeTo(it) }
+                  save(c, "outages_${days}d.csv", "text/csv") { o ->
+                      o.write(("start,end,seconds,type\n" + rows.joinToString("\n") {
+                          "${df.format(Date(it.first))},${df.format(Date(it.second))},${(it.second - it.first) / 1000},${it.third}" }).toByteArray()) }
+                  return "Saved PDF + CSV to Downloads"
+              }
+
+              fun save(c: Context, name: String, mime: String, w: (OutputStream) -> Unit) {
+                  val v = ContentValues().apply { put(MediaStore.Downloads.DISPLAY_NAME, name); put(MediaStore.Downloads.MIME_TYPE, mime) }
+                  val u = c.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
+                  c.contentResolver.openOutputStream(u)!!.use(w)
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/raj/wifiwatch
+          cat > app/src/main/java/com/raj/wifiwatch/MainActivity.kt <<'EOF'
+          package com.raj.wifiwatch
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+          import java.util.Date
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val p = getSharedPreferences("p", 0)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 64, 32, 32) }
+                  val ssid = EditText(this).apply { hint = "Home WiFi name (exact)"; setText(p.getString("ssid", "")) }
+                  val tv = TextView(this)
+                  fun refresh() {
+                      val l = Store.all(this).takeLast(40).reversed()
+                      tv.text = if (l.isEmpty()) "No outages logged yet." else
+                          l.joinToString("\n") { "${Report.df.format(Date(it.first))}  ${Report.dur(it.second - it.first)}  ${it.third}" }
+                  }
+                  fun btn(t: String, a: () -> Unit) = root.addView(Button(this).apply { text = t; setOnClickListener { a() } })
+                  root.addView(ssid)
+                  btn("Start monitoring") {
+                      p.edit().putString("ssid", ssid.text.toString().trim()).putBoolean("on", true).apply()
+                      startForegroundService(Intent(this, MonitorService::class.java))
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACCESS_FINE_LOCATION), 1)
+                  }
+                  btn("Stop") { p.edit().putBoolean("on", false).apply(); stopService(Intent(this, MonitorService::class.java)) }
+                  btn("Report: last 7 days") { Toast.makeText(this, Report.make(this, 7), Toast.LENGTH_LONG).show() }
+                  btn("Report: last 30 days") { Toast.makeText(this, Report.make(this, 30), Toast.LENGTH_LONG).show() }
+                  btn("Refresh log") { refresh() }
+                  btn("Clear log") { Store.f(this).delete(); refresh() }
+                  root.addView(ScrollView(this).apply { addView(tv) })
+                  setContentView(root); refresh()
+              }
+
+              override fun onRequestPermissionsResult(rc: Int, perms: Array<String>, r: IntArray) {
+                  if (rc == 1) requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 2)
+                  else startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.9 }
+      - run: gradle :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with: { name: WifiWatch-apk, path: app/build/outputs/apk/debug/app-debug.apk }
